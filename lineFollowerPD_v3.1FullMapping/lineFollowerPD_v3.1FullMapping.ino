@@ -1,0 +1,624 @@
+/*
+  LINE FOLLOWER - PD + STATE MACHINE + MULTI-PLAN MAPPING
+  Pin, tombol, library: lihat servo_config.h & mapping.h
+*/
+
+#include <Adafruit_NeoPixel.h>
+#include <EEPROM.h>
+#include <Adafruit_TiCoServo.h>
+#include "servo_config.h"
+
+// mapping.h di-include paling bawah file ini - forward declare dulu:
+void executeMapStep(uint8_t planNum, unsigned int simpangKe, bool &actionDone);
+void servoSweep(Adafruit_TiCoServo &s, int &posVar, int target);
+
+// ================== PIN DEFINITION ==================
+const uint8_t sensorPin[8] = {A0, A1, A2, A3, A4, A5, A6, A7};
+
+const uint8_t BTN_CALIB = 2;
+const uint8_t BTN_START = 4;
+const uint8_t BTN_STOP  = 12;
+
+// kiri-kanan dibalik dari tesMotor.ino karena roda fisiknya kebalik
+const uint8_t IN1 = 6;   // motor KANAN maju
+const uint8_t IN2 = 11;  // motor KANAN mundur
+const uint8_t IN3 = 3;   // motor KIRI maju
+const uint8_t IN4 = 5;   // motor KIRI mundur
+
+const uint8_t LED_PIN   = 13;
+const uint8_t LED_COUNT = 8;
+
+// ================== TUNING ==================
+float KP = 0.8;
+float KD = 0.4;
+
+int BASE_SPEED = 120;     // kecepatan dasar saat lurus (0-255)
+int MAX_SPEED  = 180;
+
+int LINE_LOST_THRESHOLD = 400; // kalau semua sensor normalized-nya di bawah ini = line hilang
+int PIVOT_SPEED = 110;         // kecepatan pivot saat nyari line
+
+int SENSOR_ON_THRESHOLD = 500;         // >ini = dianggap "kena hitam" (dipakai LED, simpang, deteksi diangkat)
+                                        // ini nilai normalized (0-1000) HASIL KALIBRASI, bukan ADC mentah
+const unsigned long INTERSECTION_FLASH_MS = 200; // durasi LED kuning pas simpang kedeteksi
+
+uint8_t LED_BRIGHTNESS = 20;   // 0-255, atur terang-redup semua LED sekaligus
+
+const unsigned long DEBUG_PRINT_INTERVAL = 100;   // ms, biar serial ga banjir
+const unsigned long CALIB_DURATION_MS   = 5000;   // 5 detik
+const unsigned long FINISH_DURATION_MS  = 2000;   // durasi LED hijau di state FINISH sebelum auto balik IDLE
+
+// ================== EEPROM (persist kalibrasi biar ga ilang tiap reset) ==================
+const int   EEPROM_ADDR_MAGIC = 0;      // 1 byte penanda "sudah pernah kalibrasi"
+const int   EEPROM_ADDR_DATA  = 1;      // calibMin[8] (16 byte) + calibMax[8] (16 byte)
+const uint8_t EEPROM_MAGIC_VALUE = 0xA5;
+
+// ================== STATE MACHINE ==================
+// ST_FINISH = rute mapping selesai dilewati semua (bukan STOP manual dari
+// tombol) - LED hijau blink sesaat, lalu OTOMATIS balik ke ST_IDLE lagi,
+// state/counter di-reset kaya abis baru boot, siap buat run berikutnya.
+enum RobotState { ST_IDLE, ST_CALIBRATING, ST_RUNNING, ST_STOPPED, ST_FINISH };
+RobotState currentState = ST_IDLE;
+unsigned long finishStateEnteredAt = 0;
+
+// ================== VARIABEL GLOBAL ==================
+int calibMin[8];
+int calibMax[8];
+int normalized[8]; // 0 (putih) - 1000 (hitam)
+
+int lastError = 0;
+int lastErrorSign = 1; // buat nentuin arah pivot pas line hilang
+
+bool intersectionActive = false;        // lagi di atas persimpangan (edge-trigger guard)
+unsigned long intersectionFlashUntil = 0;
+unsigned int intersectionCount = 0;
+
+bool robotLifted = false;               // edge-trigger guard buat log "robot diangkat"
+
+unsigned long lastDebugPrint = 0;
+
+bool lastReadCalib = HIGH;
+bool lastReadStart = HIGH;
+bool lastReadStop  = HIGH;
+bool startPressed;
+bool stopPressed;
+
+const uint8_t PLAN_COUNT = 8; // planNum valid: 0-7
+uint8_t planNum = 0;
+
+bool calibHeld = false;
+unsigned long calibPressStart = 0;
+const unsigned long CALIB_LONG_PRESS_MS = 600;
+
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+Adafruit_TiCoServo jepitServo;
+Adafruit_TiCoServo angkatServo;
+// posisi TERAKHIR yang di-write ke tiap servo - dipakai servoSweep() buat
+// tau harus gerak dari mana ke target berikutnya. Nilai awal DIASUMSIKAN
+// kondisi "istirahat" abis siklus ambilKotak() terakhir (jepit tertutup,
+// gripper turun) - baru boot bakal langsung di-sweep ke naik+buka di
+// setup(). Kalau ternyata posisi fisik awal robot beda, sesuaikan di sini.
+int jepitPos  = JEPIT_TUTUP_ANGLE;
+int angkatPos = ANGKAT_TURUN_ANGLE;
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println();
+  Serial.println(F("========================================"));
+  Serial.println(F("   LINE FOLLOWER - SETUP DIMULAI"));
+  Serial.println(F("========================================"));
+
+  for (uint8_t i = 0; i < 8; i++) pinMode(sensorPin[i], INPUT);
+  Serial.println(F("[OK] Sensor A0-A7 diinisialisasi"));
+
+  // default range aman kalau user belum sempat kalibrasi
+  for (uint8_t i = 0; i < 8; i++) {
+    calibMin[i] = 0;
+    calibMax[i] = 1023;
+  }
+
+  if (loadCalibrationFromEEPROM()) {
+    Serial.println(F("[OK] Kalibrasi lama ditemukan di EEPROM, langsung dipakai:"));
+    for (uint8_t i = 0; i < 8; i++) {
+      Serial.print(F("  S")); Serial.print(i);
+      Serial.print(F(": ")); Serial.print(calibMin[i]);
+      Serial.print(F(" - ")); Serial.println(calibMax[i]);
+    }
+  } else {
+    Serial.println(F("[INFO] Belum ada kalibrasi tersimpan, pakai default 0-1023"));
+  }
+
+  pinMode(BTN_CALIB, INPUT_PULLUP);
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP, INPUT_PULLUP);
+  Serial.println(F("[OK] Tombol D2(CALIBRATE) D4(START) D12(STOP) diinisialisasi"));
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopMotor();
+  Serial.println(F("[OK] Motor IN1/IN2/IN3/IN4 diinisialisasi, motor OFF"));
+
+  strip.begin();
+  strip.setBrightness(LED_BRIGHTNESS);
+  strip.clear();
+  strip.show();
+  Serial.println(F("[OK] LED WS2812 (D13) diinisialisasi"));
+
+  jepitServo.attach(SERVO_JEPIT_PIN);
+  angkatServo.attach(SERVO_ANGKAT_PIN);
+  Serial.println(F("[OK] Servo jepit(D9) & angkat(D10) diinisialisasi"));
+  Serial.println(F("[SERVO] Sweep halus ke posisi awal: NAIK + BUKA..."));
+  servoSweep(angkatServo, angkatPos, ANGKAT_NAIK_ANGLE); // naik dulu baru buka,
+  servoSweep(jepitServo, jepitPos, JEPIT_BUKA_ANGLE);    // biar ga buka pas masih di bawah
+  Serial.println(F("[SERVO] Posisi awal siap (naik + buka)"));
+
+  Serial.println(F("========================================"));
+  Serial.println(F("SETUP SELESAI - IDLE, tombol bebas ditekan kapan aja:"));
+  Serial.println(F("  D2 CALIBRATE | D4 START | D12 STOP"));
+  Serial.println(F("========================================"));
+
+  currentState = ST_IDLE;
+}
+
+// ================== LOOP (STATE MACHINE BEBAS) ==================
+void loop() {
+  // ---- CALIB: tahan >=600ms = kalibrasi, sesaat = planNum turun (cuma di IDLE/STOPPED) ----
+  bool calibReading = digitalRead(BTN_CALIB);
+  if (lastReadCalib == HIGH && calibReading == LOW) {
+    delay(30);
+    if (digitalRead(BTN_CALIB) == LOW) {
+      calibHeld = true;
+      calibPressStart = millis();
+    }
+  }
+  if (calibHeld && calibReading == HIGH) {
+    calibHeld = false;
+    unsigned long heldMs = millis() - calibPressStart;
+    if (heldMs >= CALIB_LONG_PRESS_MS) {
+      stopMotor();
+      Serial.println(F("[BTN] CALIBRATE (tahan) -> kalibrasi"));
+      currentState = ST_CALIBRATING;
+      doCalibration();
+      Serial.println(F("[STATE] -> IDLE"));
+      currentState = ST_IDLE;
+      lastReadCalib = calibReading;
+      return;
+    } else if (currentState == ST_IDLE || currentState == ST_STOPPED) {
+      planNum = (planNum == 0) ? (PLAN_COUNT - 1) : (planNum - 1);
+      Serial.print(F("[PLAN] planNum -> "));
+      Serial.println(planNum);
+    }
+  }
+  lastReadCalib = calibReading;
+
+  startPressed = checkButton(BTN_START, lastReadStart);
+  stopPressed  = checkButton(BTN_STOP, lastReadStop);
+
+  if (startPressed && currentState != ST_RUNNING) {
+    Serial.print(F("[BTN] START ditekan -> RUNNING (planNum "));
+    Serial.print(planNum);
+    Serial.println(F(")"));
+    lastError = 0;
+    currentState = ST_RUNNING;
+  }
+  if (stopPressed) {
+    if (currentState == ST_IDLE || currentState == ST_STOPPED) {
+      planNum = (planNum + 1) % PLAN_COUNT;
+      Serial.print(F("[PLAN] planNum -> "));
+      Serial.println(planNum);
+    } else {
+      stopMotor();
+      solidRed();
+      intersectionCount = 0;
+      intersectionActive = false;
+      Serial.println(F("[BTN] STOP ditekan -> motor berhenti"));
+      currentState = ST_STOPPED;
+    }
+  }
+
+  switch (currentState) {
+    case ST_IDLE:
+      rainbowIdle();
+      indicatePlanNum();
+      break;
+    case ST_RUNNING:
+      runLineFollowing();
+      break;
+    case ST_STOPPED:
+      rainbowIdle();
+      indicatePlanNum();
+      break;
+    case ST_FINISH:
+      indicateFinish();
+      if (millis() - finishStateEnteredAt > FINISH_DURATION_MS) {
+        Serial.println(F("[STATE] FINISH selesai -> balik ke IDLE, siap run berikutnya"));
+        intersectionCount = 0;
+        intersectionActive = false;
+        currentState = ST_IDLE;
+      }
+      break;
+    case ST_CALIBRATING:
+      break;
+  }
+}
+
+// ================== LINE FOLLOWING (dipanggil tiap loop saat RUNNING) ==================
+void runLineFollowing() {
+  readAndNormalize();
+
+  // ---- cek robot diangkat: SEMUA sensor gelap barengan (ga ada permukaan buat mantul) ----
+  bool allBlack = true;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (normalized[i] <= SENSOR_ON_THRESHOLD) { allBlack = false; break; }
+  }
+  if (allBlack) {
+    stopMotor();
+    indicateLifted();
+    if (!robotLifted) {
+      robotLifted = true;
+      Serial.println(F("[ANGKAT] Semua sensor gelap barengan - robot kemungkinan diangkat, motor dimatikan"));
+    }
+    return; // skip semua logic line-following/simpang selama diangkat
+  } else if (robotLifted) {
+    robotLifted = false;
+    Serial.println(F("[ANGKAT] Robot balik ke track, lanjut jalan normal"));
+  }
+
+  long weightedSum = 0;
+  long sumVal = 0;
+  int maxVal = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    weightedSum += (long)normalized[i] * (i * 1000L);
+    sumVal += normalized[i];
+    if (normalized[i] > maxVal) maxVal = normalized[i];
+  }
+
+  bool lineDetected = (maxVal >= LINE_LOST_THRESHOLD);
+
+  if (!lineDetected) {
+    indicateLineLost();
+    if (lastErrorSign >= 0) {
+      setMotor(PIVOT_SPEED, -PIVOT_SPEED);   // pivot kanan
+    } else {
+      setMotor(-PIVOT_SPEED, PIVOT_SPEED);   // pivot kiri
+    }
+    if (millis() - lastDebugPrint > DEBUG_PRINT_INTERVAL) {
+      lastDebugPrint = millis();
+      Serial.print(F("[RUNNING] LINE HILANG (maxVal:"));
+      Serial.print(maxVal);
+      Serial.print(F(") - pivot ke "));
+      Serial.println(lastErrorSign >= 0 ? F("KANAN") : F("KIRI"));
+    }
+    return;
+  }
+
+  int position = weightedSum / sumVal;   // 0 (paling kiri) .. 7000 (paling kanan)
+  int error = position - 3500;           // 3500 = titik tengah 8 sensor
+
+  lastErrorSign = (error >= 0) ? 1 : -1;
+
+  int derivative = error - lastError;
+  lastError = error;
+
+  int correction = (int)(KP * error + KD * derivative);
+
+  int leftSpeed  = constrain(BASE_SPEED + correction, 0, MAX_SPEED);
+  int rightSpeed = constrain(BASE_SPEED - correction, 0, MAX_SPEED);
+
+  setMotor(leftSpeed, rightSpeed);
+
+  // ---- deteksi persimpangan: S0 & S7 hitam, TAPI masih ada sensor tengah yang putih ----
+  // (syarat "ada putih di tengah" ini yang bedain simpang asli vs kondisi diangkat/full black)
+  bool anyMiddleWhite = false;  
+  for (uint8_t i = 0; i < 8; i++) {
+    if (i == 1 || i == 6) continue;
+    if (normalized[i] <= SENSOR_ON_THRESHOLD) { anyMiddleWhite = true; break; }
+  }
+  
+  bool onIntersectionNow = (normalized[1] > SENSOR_ON_THRESHOLD) &&
+                           (normalized[6] > SENSOR_ON_THRESHOLD) &&
+                            anyMiddleWhite;
+                            
+  if (onIntersectionNow && !intersectionActive) {
+    intersectionActive = true;
+    intersectionCount++;
+    intersectionFlashUntil = millis() + INTERSECTION_FLASH_MS;
+    Serial.print(F("[SIMPANG] Persimpangan terdeteksi! Total: "));
+    Serial.println(intersectionCount);
+
+    // ---- cek mapping.h: ada script buat simpang ini di plan yang aktif? ----
+    bool actionDone = false;
+    executeMapStep(planNum, intersectionCount, actionDone);
+    if (actionDone) {
+      return; // simpang ini udah dihandle manual di mapping.h, skip sisa loop iterasi ini
+    }
+    // kalau actionDone masih false (case kosong/belum di-map di mapping.h)
+    // -> lanjut ke behavior default LURUS di bawah, ga ada yang berubah sama sekali
+  } else if (!onIntersectionNow && intersectionActive) {
+    intersectionActive = false; // robot udah lewat, siap deteksi simpang berikutnya
+  }
+
+  if (millis() < intersectionFlashUntil) {
+    indicateIntersection();
+  } else {
+    indicateSensorBar();
+  }
+
+  if (millis() - lastDebugPrint > DEBUG_PRINT_INTERVAL) {
+    lastDebugPrint = millis();
+    Serial.print(F("[RUNNING] sensor:"));
+    for (uint8_t i = 0; i < 8; i++) {
+      Serial.print(normalized[i]);
+      Serial.print(i < 7 ? "," : " ");
+    }
+    Serial.print(F("pos:")); Serial.print(position);
+    Serial.print(F(" err:")); Serial.print(error);
+    Serial.print(F(" L:")); Serial.print(leftSpeed);
+    Serial.print(F(" R:")); Serial.print(rightSpeed);
+    Serial.print(F(" simpang:")); Serial.println(intersectionCount);
+  }
+}
+
+// ================== SENSOR ==================
+void readAndNormalize() {
+  for (uint8_t i = 0; i < 8; i++) {
+    int raw = analogRead(sensorPin[i]);
+    int val = map(raw, calibMin[i], calibMax[i], 0, 1000);
+    normalized[i] = constrain(val, 0, 1000);
+  }
+}
+
+void doCalibration() {
+  for (uint8_t i = 0; i < 8; i++) {
+    calibMin[i] = 1023;
+    calibMax[i] = 0;
+  }
+
+  Serial.println(F("----------------------------------------"));
+  Serial.print(F("[KALIBRASI] DIMULAI - geser robot manual ngelewatin garis selama "));
+  Serial.print(CALIB_DURATION_MS / 1000);
+  Serial.println(F(" detik!"));
+
+  unsigned long t0 = millis();
+  unsigned long lastTick = 0;
+  while (millis() - t0 < CALIB_DURATION_MS) {
+    for (uint8_t i = 0; i < 8; i++) {
+      int raw = analogRead(sensorPin[i]);
+      if (raw < calibMin[i]) calibMin[i] = raw;
+      if (raw > calibMax[i]) calibMax[i] = raw;
+    }
+    calibratingBlink();
+
+    if (millis() - lastTick > 500) {
+      lastTick = millis();    
+      Serial.print(F("[KALIBRASI] sisa waktu: "));
+      Serial.print((CALIB_DURATION_MS - (millis() - t0)) / 1000.0, 1);
+      Serial.println(F(" detik"));
+    }
+    if (!digitalRead(BTN_STOP)) break;
+  }
+
+  for (uint8_t i = 0; i < 8; i++) {
+    if (calibMax[i] - calibMin[i] < 20) calibMax[i] = calibMin[i] + 20;
+  }
+
+  Serial.println(F("[KALIBRASI] SELESAI. Hasil per sensor (min - max):"));
+  for (uint8_t i = 0; i < 8; i++) {
+    Serial.print(F("  S")); Serial.print(i);
+    Serial.print(F(": ")); Serial.print(calibMin[i]);
+    Serial.print(F(" - ")); Serial.println(calibMax[i]);
+  }
+  Serial.println(F("----------------------------------------"));
+
+  saveCalibrationToEEPROM();
+  Serial.println(F("[KALIBRASI] Tersimpan ke EEPROM - ga perlu diulang tiap reset"));
+
+  strip.clear();
+  strip.show();
+  flashGreen();
+}
+
+// simpan/baca calibMin & calibMax dari EEPROM, ditandai 1 byte magic biar
+// EEPROM kosong (chip baru) ga kebaca sebagai data valid
+void saveCalibrationToEEPROM() {
+  EEPROM.put(EEPROM_ADDR_DATA, calibMin);
+  EEPROM.put(EEPROM_ADDR_DATA + sizeof(calibMin), calibMax);
+  EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_VALUE);
+}
+
+bool loadCalibrationFromEEPROM() {
+  if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC_VALUE) return false;
+  EEPROM.get(EEPROM_ADDR_DATA, calibMin);
+  EEPROM.get(EEPROM_ADDR_DATA + sizeof(calibMin), calibMax);
+  return true;
+}
+
+// ================== TOMBOL ==================
+// deteksi falling edge (HIGH -> LOW) dengan debounce sederhana
+bool checkButton(uint8_t pin, bool &lastReading) {
+  bool reading = digitalRead(pin);
+  bool triggered = false;
+  if (lastReading == HIGH && reading == LOW) {
+    delay(30);
+    if (digitalRead(pin) == LOW) triggered = true;
+  }
+  lastReading = reading;
+  return triggered;
+}
+
+// ================== MOTOR ==================
+// speed: -255..255, negatif = mundur
+void setMotor(int leftSpeed, int rightSpeed) {
+  leftSpeed  = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
+
+  if (leftSpeed >= 0) {
+    analogWrite(IN3, leftSpeed);
+    analogWrite(IN4, 0);
+  } else {
+    analogWrite(IN3, 0);
+    analogWrite(IN4, -leftSpeed);
+  }
+
+  if (rightSpeed >= 0) {
+    analogWrite(IN1, rightSpeed);
+    analogWrite(IN2, 0);
+  } else {
+    analogWrite(IN1, 0);
+    analogWrite(IN2, -rightSpeed);
+  }
+}
+
+void stopMotor() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// ================== INDIKATOR WS2812 ==================
+// tiap LED mewakili 1 sensor fisik: nyala merah kalau sensor itu kena garis hitam
+void indicateSensorBar() {
+  for (uint8_t i = 0; i < 8; i++) {
+    if (normalized[i] > SENSOR_ON_THRESHOLD) {
+      strip.setPixelColor(i, strip.Color(255, 0, 0)); // merah = kena garis
+    } else {
+      strip.setPixelColor(i, strip.Color(0, 0, 60));  // biru redup = area kosong
+    }
+  }
+  strip.show();
+}
+
+// putih blink cepat, nandain "robot lagi diangkat, motor mati"
+void indicateLifted() {
+  static bool on = false;
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 100) {
+    on = !on;
+    lastBlink = millis();
+    uint32_t c = on ? strip.Color(80, 80, 80) : strip.Color(0, 0, 0);
+    for (uint8_t i = 0; i < 8; i++) strip.setPixelColor(i, c);
+    strip.show();
+  }
+}
+
+// kuning nyala penuh sesaat, nandain "persimpangan baru aja kedeteksi"
+void indicateIntersection() {
+  for (uint8_t i = 0; i < 8; i++) {
+    strip.setPixelColor(i, strip.Color(255, 150, 0));
+  }
+  strip.show();
+}
+
+void indicateLineLost() {
+  static bool on = false;
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 100) {
+    on = !on;
+    lastBlink = millis();
+    uint32_t c = on ? strip.Color(255, 0, 0) : strip.Color(0, 0, 0);
+    for (uint8_t i = 0; i < 8; i++) strip.setPixelColor(i, c);
+    strip.show();
+  }
+}
+
+void calibratingBlink() {
+  static unsigned long lastUpdate = 0;
+  static int8_t pos = 0;
+  static int8_t direction = 1;  // 1 = kanan, -1 = kiri
+
+  if (millis() - lastUpdate > 120) {
+    lastUpdate = millis();
+    strip.clear();
+    strip.setPixelColor(pos, strip.Color(255, 255, 255));
+    strip.show();
+    pos += direction;
+    // Balik arah saat mencapai ujung
+    if (pos >= 7) {
+      pos = 7;
+      direction = -1;
+    } 
+    else if (pos <= 0) {
+      pos = 0;
+      direction = 1;
+    }
+  }
+}
+
+// blink putih sesaat di posisi index=planNum, numpuk di atas rainbowIdle()
+void indicatePlanNum() {
+  static unsigned long lastToggle = 0;
+  static bool on = false;
+  if (millis() - lastToggle > 100) {
+    on = !on;
+    lastToggle = millis();
+    if (on) {
+      strip.clear();
+      strip.setPixelColor(planNum, strip.Color(255, 255, 255));
+      strip.show();
+    }
+  }
+}
+
+void rainbowIdle() {
+  static unsigned long lastUpdate = 0;
+  static uint16_t hue = 0;
+  if (millis() - lastUpdate > 20) {
+    lastUpdate = millis();
+    for (uint8_t i = 0; i < 8; i++) {
+      uint32_t c = strip.gamma32(strip.ColorHSV(hue + i * 8192));
+      strip.setPixelColor(i, c);
+    }
+    strip.show();
+    hue += 400;
+  }
+}
+
+// merah nyala terus, nandain "robot lagi STOP" - dipanggil terus tiap loop
+// selama currentState == ST_STOPPED, jadi ga bakal balik sendiri ke rainbow
+void solidRed() {
+  for (uint8_t i = 0; i < 8; i++) {
+    strip.setPixelColor(i, strip.Color(255, 0, 0));
+  }
+  strip.setBrightness(70);
+  strip.show();
+  strip.setBrightness(LED_BRIGHTNESS);
+}
+
+// blink hijau, nandain "rute mapping selesai (FINISH)" - dipanggil terus
+// tiap loop selama currentState == ST_FINISH, sebelum auto balik ke IDLE
+void indicateFinish() {
+  static bool on = false;
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 120) {
+    on = !on;
+    lastBlink = millis();
+    uint32_t c = on ? strip.Color(0, 255, 0) : strip.Color(0, 0, 0);
+    for (uint8_t i = 0; i < 8; i++) strip.setPixelColor(i, c);
+    strip.show();
+  }
+}
+
+// kedip hijau sekali, nandain "kalibrasi baru aja selesai"
+void flashGreen() {
+  for (uint8_t r = 0; r < 2; r++) {
+    for (uint8_t i = 0; i < 8; i++) strip.setPixelColor(i, strip.Color(0, 255, 0));
+    strip.show();
+    delay(150);
+    strip.clear();
+    strip.show();
+    delay(150);
+  }
+}
+
+// mapping.h di-include di SINI (paling bawah) - biar semua yang dia butuhin
+// (strip, setMotor, stopMotor, BASE_SPEED, PIVOT_SPEED, BTN_STOP, currentState,
+// ST_FINISH, finishStateEnteredAt, lastError, lastErrorSign) udah pasti
+// kekenal duluan sama compiler.
+#include "mapping.h"
